@@ -1,0 +1,12 @@
+{
+  "name": "allRunners",
+  "short_name": "allRunners",
+  "description": "Running log with Smashrun sync, map trails, and pace tools.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#e8f0fb",
+  "theme_color": "#0f172a",
+  "categories": ["health", "fitness", "lifestyle"]
+}
