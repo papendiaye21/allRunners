@@ -4,8 +4,8 @@ A full-stack running tracker for logging workouts, syncing with Smashrun, and vi
 
 ## Features
 
-- **Run logging:** Add runs with distance, time, and date; preview pace before saving.
-- **Smashrun sync:** OAuth 2.0 login to load, create, update, and delete activities from your Smashrun account.
+- **Run logging:** Add runs with distance, time, date, and notes; preview pace before saving. Runs are stored in SQLite on this computer even when Smashrun is disconnected.
+- **Smashrun sync:** Optional OAuth 2.0 login to copy activities to and from your Smashrun account.
 - **Dashboard:** Stats, goals, splits, filters, sorting, and incremental sync for your run list.
 - **Map & trails:** Record GPS trails in the browser; trail data stays on your device (`localStorage`).
 - **Weather:** Current conditions via Open-Meteo with place search and geocoding fallbacks.
@@ -16,7 +16,7 @@ A full-stack running tracker for logging workouts, syncing with Smashrun, and vi
 - **Frontend:** HTML, CSS, JavaScript (vanilla SPA)
 - **Backend:** Python, Flask
 - **APIs:** Smashrun OAuth/API, Open-Meteo weather
-- **Storage:** Flask sessions (OAuth tokens), browser `localStorage` (trails)
+- **Storage:** SQLite file `data/runs.sqlite` (runs), Flask sessions (OAuth tokens), browser `localStorage` (trails and on-device notes)
 
 ## Installation
 
@@ -25,7 +25,7 @@ To run this project locally:
 1. Clone the repository:
 
    ```bash
-   git clone https://github.com/YOUR_USERNAME/allRunners.git
+   git clone https://github.com/papendiaye21/allRunners.git
    cd allRunners
    ```
 

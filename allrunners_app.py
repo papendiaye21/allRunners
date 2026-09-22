@@ -23,6 +23,7 @@ from config import (
     smashrun_client_id,
     smashrun_client_secret,
 )
+import runs_db
 from smashrun_api import SmashrunApiError, SmashrunClient
 from weather_api import fetch_current_weather, fetch_weather_for_place
 
@@ -37,6 +38,7 @@ app.config["SMASHRUN_CLIENT_ID"] = smashrun_client_id()
 app.config["SMASHRUN_CLIENT_SECRET"] = smashrun_client_secret()
 
 smashrun = SmashrunClient(timeout_s=20.0, retries=2)
+runs_db.init(ROOT / "data" / "runs.sqlite")
 
 
 def effective_service_key() -> str | None:
@@ -133,6 +135,14 @@ def _require_access_token() -> str:
     return token
 
 
+def _access_token_or_none() -> str | None:
+    """Return a Smashrun token when the user is connected. Local runs still work without one."""
+    try:
+        return _require_access_token()
+    except SmashrunApiError:
+        return None
+
+
 def _smashrun_error_response(e: SmashrunApiError):
     code = (e.code or "").lower()
     status = int(e.status or 502)
@@ -206,6 +216,7 @@ def _to_local_run(activity: dict[str, Any]) -> dict[str, Any]:
         "date": date_text,
         "notes": str(activity.get("notes") or ""),
         "source": "smashrun",
+        "externalId": str(activity.get("externalId") or activity.get("external_id") or ""),
     }
     if mod is not None:
         out["_modifiedUtc"] = mod
@@ -481,29 +492,48 @@ def oauth_callback() -> object:
         )
 
 
+def _sync_smashrun_into_db(token: str, *, page: int, count: int, from_date_utc: int | None) -> bool:
+    raw = smashrun.get_activities(
+        token,
+        page=max(0, page),
+        count=min(max(1, count), 200),
+        from_date_utc=from_date_utc,
+    )
+    for activity in _normalize_activity_list(raw):
+        runs_db.upsert_smashrun(_to_local_run(activity))
+    return True
+
+
 @app.get("/api/runs")
 def api_runs_list():
     try:
-        token = _require_access_token()
         page = int(request.args.get("page", "0"))
         count = int(request.args.get("count", "100"))
         from_raw = (request.args.get("fromDateUTC") or request.args.get("from_date_utc") or "").strip()
         from_date_utc: int | None = None
         if from_raw:
             from_date_utc = int(from_raw)
-        raw = smashrun.get_activities(
-            token,
-            page=max(0, page),
-            count=min(max(1, count), 200),
-            from_date_utc=from_date_utc,
-        )
-        acts = _normalize_activity_list(raw)
-        runs = [_to_local_run(a) for a in acts]
-        return jsonify(runs=runs, count=len(runs), fromDateUTC=from_date_utc)
     except ValueError:
         return jsonify(error="invalid_pagination"), 400
-    except SmashrunApiError as e:
-        return _smashrun_error_response(e)
+
+    smashrun_synced = False
+    token = _access_token_or_none()
+    if token:
+        try:
+            smashrun_synced = _sync_smashrun_into_db(
+                token, page=page, count=count, from_date_utc=from_date_utc
+            )
+        except SmashrunApiError:
+            smashrun_synced = False
+
+    runs = runs_db.list_runs()
+    return jsonify(
+        runs=runs,
+        count=len(runs),
+        fromDateUTC=from_date_utc,
+        smashrun_synced=smashrun_synced,
+        storage="sqlite",
+    )
 
 
 @app.post("/api/runs")
@@ -524,49 +554,99 @@ def api_runs_create():
     except ValueError:
         return jsonify(error="invalid_date"), 400
 
+    notes = str(data.get("notes") or "")
+    external_id = str(data.get("externalId") or data.get("external_id") or "").strip()
+    saved = runs_db.insert_local(
+        distance=d,
+        time_min=t,
+        date=date_text,
+        notes=notes,
+        external_id=external_id,
+    )
+
+    token = _access_token_or_none()
+    if not token:
+        return jsonify(ok=True, run=saved, saved="local")
+
     try:
-        token = _require_access_token()
-        payload = _to_smashrun_activity(data)
+        payload = _to_smashrun_activity({**data, "externalId": saved.get("externalId") or external_id})
         raw = smashrun.create_activity(token, payload)
         created = raw if isinstance(raw, dict) else {}
-        out = _to_local_run(created) if created else _to_local_run(payload)
-        return jsonify(ok=True, run=out, smashrun=raw)
+        mapped = _to_local_run(created) if created else {}
+        smashrun_id = mapped.get("id")
+        if smashrun_id:
+            updated = runs_db.attach_smashrun(
+                str(saved["id"]),
+                str(smashrun_id),
+                mapped.get("_modifiedUtc") if isinstance(mapped.get("_modifiedUtc"), int) else None,
+            )
+            if updated:
+                saved = updated
+        return jsonify(ok=True, run=saved, saved="smashrun", smashrun=raw)
     except SmashrunApiError as e:
-        return _smashrun_error_response(e)
+        return jsonify(ok=True, run=saved, saved="local", smashrun_error=e.message)
 
 
 @app.get("/api/runs/<activity_id>")
 def api_run_detail(activity_id: str):
-    try:
-        token = _require_access_token()
-        raw = smashrun.get_activity_detail(token, activity_id)
-        if not isinstance(raw, dict):
-            return jsonify(error="invalid_response"), 502
-        return jsonify(run=_to_local_run(raw), smashrun=raw)
-    except SmashrunApiError as e:
-        return _smashrun_error_response(e)
+    local = runs_db.get_run(activity_id)
+    token = _access_token_or_none()
+    smashrun_id = str((local or {}).get("smashrunId") or "")
+    remote_id = smashrun_id or ("" if str(activity_id).startswith("local-") else activity_id)
+    if token and remote_id:
+        try:
+            raw = smashrun.get_activity_detail(token, remote_id)
+            if isinstance(raw, dict):
+                mapped = _to_local_run(raw)
+                runs_db.upsert_smashrun(mapped)
+                fresh = runs_db.get_run(activity_id) or runs_db.get_run(str(mapped.get("id") or ""))
+                return jsonify(run=fresh or mapped, smashrun=raw)
+        except SmashrunApiError:
+            if local:
+                return jsonify(run=local)
+            return jsonify(error="not_found"), 404
+    if local:
+        return jsonify(run=local)
+    return jsonify(error="not_found"), 404
 
 
 @app.delete("/api/runs/<activity_id>")
 def api_run_delete(activity_id: str):
-    try:
-        token = _require_access_token()
-        raw = smashrun.delete_activity(token, activity_id)
-        return jsonify(ok=True, smashrun=raw)
-    except SmashrunApiError as e:
-        return _smashrun_error_response(e)
+    local = runs_db.get_run(activity_id)
+    if not local:
+        return jsonify(error="not_found"), 404
+    smashrun_id = str(local.get("smashrunId") or "")
+    if smashrun_id:
+        token = _access_token_or_none()
+        if not token:
+            return jsonify(
+                error="not_connected",
+                detail="Connect Smashrun to delete a run that was synced there.",
+            ), 401
+        try:
+            smashrun.delete_activity(token, smashrun_id)
+        except SmashrunApiError as e:
+            return _smashrun_error_response(e)
+    runs_db.delete_run(str(local["id"]))
+    return jsonify(ok=True, saved="local")
 
 
 @app.patch("/api/runs/<activity_id>/notes")
 def api_run_patch_notes(activity_id: str):
     data = request.get_json(silent=True) or {}
     notes = str(data.get("notes") or "")
-    try:
-        token = _require_access_token()
-        raw = smashrun.patch_activity(token, activity_id, {"notes": notes[:800]})
-        return jsonify(ok=True, smashrun=raw)
-    except SmashrunApiError as e:
-        return _smashrun_error_response(e)
+    updated = runs_db.update_notes(activity_id, notes)
+    if not updated:
+        return jsonify(error="not_found"), 404
+    smashrun_id = str(updated.get("smashrunId") or "")
+    token = _access_token_or_none()
+    if smashrun_id and token:
+        try:
+            raw = smashrun.patch_activity(token, smashrun_id, {"notes": notes[:800]})
+            return jsonify(ok=True, run=updated, saved="smashrun", smashrun=raw)
+        except SmashrunApiError as e:
+            return jsonify(ok=True, run=updated, saved="local", smashrun_error=e.message)
+    return jsonify(ok=True, run=updated, saved="local")
 
 
 @app.post("/api/runs/<activity_id>/trail-sync")
@@ -578,12 +658,25 @@ def api_run_sync_trail(activity_id: str):
     if len(points) < 2:
         return jsonify(error="trail_too_short"), 400
 
+    local = runs_db.get_run(activity_id)
+    smashrun_id = str((local or {}).get("smashrunId") or "")
+    token = _access_token_or_none()
+    if not token or not smashrun_id:
+        line = _trail_notes_line(name=name, mode=mode, points=points)
+        existing = str((local or {}).get("notes") or "")
+        marker = "[allRunners trail]"
+        kept = [ln for ln in existing.splitlines() if not ln.strip().startswith(marker)]
+        kept.append(line)
+        merged = "\n".join([ln for ln in kept if ln.strip()]).strip()[:800]
+        if local:
+            runs_db.update_notes(str(local["id"]), merged)
+        return jsonify(ok=True, sync_state="local", strategy="device")
+
     try:
-        token = _require_access_token()
         # First try a direct route patch. Some Smashrun setups may not accept this schema yet.
         direct_payload = {"route": {"source": "allrunners", "mode": mode, "points": points}}
         try:
-            raw = smashrun.patch_activity(token, activity_id, direct_payload)
+            raw = smashrun.patch_activity(token, smashrun_id, direct_payload)
             return jsonify(ok=True, sync_state="uploaded", strategy="direct_patch", smashrun=raw)
         except SmashrunApiError as primary_err:
             app.logger.warning(
@@ -597,7 +690,7 @@ def api_run_sync_trail(activity_id: str):
             # Fallback: persist compact route metadata in notes so trail status can still sync cross-device.
             existing_notes = ""
             try:
-                detail = smashrun.get_activity_detail(token, activity_id)
+                detail = smashrun.get_activity_detail(token, smashrun_id)
                 if isinstance(detail, dict):
                     existing_notes = str(detail.get("notes") or "")
             except SmashrunApiError:
@@ -607,7 +700,9 @@ def api_run_sync_trail(activity_id: str):
             kept = [ln for ln in existing_notes.splitlines() if not ln.strip().startswith(marker)]
             kept.append(_trail_notes_line(name=name, mode=mode, points=points))
             merged_notes = "\n".join([ln for ln in kept if ln.strip()]).strip()[:800]
-            raw2 = smashrun.patch_activity(token, activity_id, {"notes": merged_notes})
+            raw2 = smashrun.patch_activity(token, smashrun_id, {"notes": merged_notes})
+            if local:
+                runs_db.update_notes(str(local["id"]), merged_notes)
             return jsonify(
                 ok=True,
                 sync_state="notes_fallback",
@@ -663,11 +758,23 @@ def api_goals():
         return _smashrun_error_response(e)
 
 
+def _smashrun_activity_key(activity_id: str) -> str | None:
+    local = runs_db.get_run(activity_id)
+    if local and local.get("smashrunId"):
+        return str(local["smashrunId"])
+    if str(activity_id).startswith("local-"):
+        return None
+    return activity_id
+
+
 @app.get("/api/runs/<activity_id>/notables")
 def api_run_notables(activity_id: str):
+    remote_id = _smashrun_activity_key(activity_id)
+    token = _access_token_or_none()
+    if not remote_id or not token:
+        return jsonify([])
     try:
-        token = _require_access_token()
-        raw = smashrun.get_notables(token, activity_id)
+        raw = smashrun.get_notables(token, remote_id)
         return jsonify(raw)
     except SmashrunApiError as e:
         return _smashrun_error_response(e)
@@ -675,9 +782,12 @@ def api_run_notables(activity_id: str):
 
 @app.get("/api/runs/<activity_id>/splits/<unit>")
 def api_run_splits(activity_id: str, unit: str):
+    remote_id = _smashrun_activity_key(activity_id)
+    token = _access_token_or_none()
+    if not remote_id or not token:
+        return jsonify(message="Splits are available after this run syncs to Smashrun.")
     try:
-        token = _require_access_token()
-        raw = smashrun.get_splits(token, activity_id, unit=unit)
+        raw = smashrun.get_splits(token, remote_id, unit=unit)
         return jsonify(raw)
     except SmashrunApiError as e:
         return _smashrun_error_response(e)
@@ -685,9 +795,12 @@ def api_run_splits(activity_id: str, unit: str):
 
 @app.get("/api/runs/<activity_id>/tags")
 def api_run_tags(activity_id: str):
+    remote_id = _smashrun_activity_key(activity_id)
+    token = _access_token_or_none()
+    if not remote_id or not token:
+        return jsonify(tags=[])
     try:
-        token = _require_access_token()
-        raw = smashrun.get_tags(token, activity_id)
+        raw = smashrun.get_tags(token, remote_id)
         return jsonify(raw)
     except SmashrunApiError as e:
         return _smashrun_error_response(e)

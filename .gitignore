@@ -26,3 +26,6 @@ Thumbs.db
 # Logs and local data
 *.log
 runs.txt
+data/
+*.sqlite
+*.sqlite3

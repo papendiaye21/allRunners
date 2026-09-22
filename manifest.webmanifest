@@ -1,12 +1,32 @@
 {
   "name": "allRunners",
   "short_name": "allRunners",
-  "description": "Running log with Smashrun sync, map trails, and pace tools.",
+  "description": "Running log with local storage, optional Smashrun sync, map trails, and pace tools.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
   "orientation": "portrait-primary",
   "background_color": "#e8f0fb",
   "theme_color": "#0f172a",
-  "categories": ["health", "fitness", "lifestyle"]
+  "categories": ["health", "fitness", "lifestyle"],
+  "icons": [
+    {
+      "src": "/static/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/static/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/static/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
 }
